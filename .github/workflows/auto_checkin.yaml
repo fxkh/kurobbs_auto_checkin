@@ -9,6 +9,8 @@ on:
 jobs:
   auto-sign:
     runs-on: ubuntu-latest  # 使用最新的 Ubuntu 环境
+  env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # 强制使用 Node.js 24
 
     steps:
       # 1. 检出代码
