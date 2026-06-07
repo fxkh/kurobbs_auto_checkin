@@ -13,27 +13,21 @@ jobs:
     steps:
       # 1. 检出代码
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       # 2. 设置 Python 环境
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'  # 指定 Python 版本
 
-      # 3. 设置 Node 环境
-      - name: Set up Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-
-      # 4. 安装依赖
+      # 3. 安装依赖
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt  # 如果有依赖文件
 
-      # 5. 运行脚本并捕获输出
+      # 4. 运行脚本并捕获输出
       - name: Run auto checkin script
         id: run_script  # 给步骤命名，方便后续引用输出
         continue-on-error: true
