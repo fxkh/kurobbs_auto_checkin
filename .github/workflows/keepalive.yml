@@ -12,6 +12,8 @@ permissions:
 jobs:
   keepalive:
     runs-on: ubuntu-latest
+    env:
+        FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # 强制使用 Node.js 24
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
