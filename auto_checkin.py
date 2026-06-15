@@ -2,16 +2,9 @@ import os
 import sys
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
-
-# 兼容 Python<3.9 & Windows 时区问题
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:
-    from backports.zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from loguru import logger
 from pydantic import BaseModel, Field
 
@@ -19,210 +12,223 @@ from ext_notification import NotificationService
 from logging_utils import configure_logger
 from settings import Settings, SettingsError, parse_bool
 
-# ===================== 常量抽离 =====================
-GAME_ID_DEFAULT = 2
-USER_INFO_TYPE = 1
-# API 地址
-FIND_ROLE_LIST_API_URL = "https://api.kurobbs.com/gamer/role/default"
-SIGN_URL = "https://api.kurobbs.com/encourage/signIn/v2"
-USER_SIGN_URL = "https://api.kurobbs.com/user/signIn"
-USER_MINE_URL = "https://api.kurobbs.com/user/mineV2"
-# 请求基础头
-BASE_HEADERS = {
-    "osversion": "Android",
-    "devcode": "2fba3859fe9bfe9099f2696b8648c2c6",
-    "countrycode": "CN",
-    "ip": "10.0.2.233",
-    "model": "2211133C",
-    "source": "android",
-    "lang": "zh-Hans",
-    "version": "1.0.9",
-    "versioncode": "1090",
-    "content-type": "application/x-www-form-urlencoded; charset=utf-8",
-    "accept-encoding": "gzip",
-    "user-agent": "okhttp/3.10.0",
-}
-# 提示文案
-MSG_SIGN_SUCCESS = "签到成功"
-MSG_SIGN_DONE = "今日已完成签到"
-MSG_SIGN_FAIL = "签到失败"
-
 
 class Response(BaseModel):
-    code: int = Field(..., alias="code", description="返回码")
+    code: int = Field(..., alias="code", description="返回值")
     msg: str = Field(..., alias="msg", description="提示信息")
-    success: Optional[bool] = Field(None, alias="success", description="操作结果")
-    data: Optional[Any] = Field(None, alias="data", description="返回数据")
+    success: Optional[bool] = Field(None, alias="success", description="token有时才有")
+    data: Optional[Any] = Field(None, alias="data", description="请求成功才有")
 
 
 class KurobbsClientException(Exception):
-    """库洛论坛客户端自定义异常"""
+    """Custom exception for Kurobbs client errors."""
 
 
 class KurobbsClient:
-    def __init__(self, token: str):
-        if not token or not token.strip():
-            raise KurobbsClientException("Token 不能为空，请检查配置")
+    FIND_ROLE_LIST_API_URL = "https://api.kurobbs.com/gamer/role/default"
+    SIGN_URL = "https://api.kurobbs.com/encourage/signIn/v2"
+    USER_SIGN_URL = "https://api.kurobbs.com/user/signIn"
+    USER_MINE_URL = "https://api.kurobbs.com/user/mineV2"
 
-        self.token = token.strip()
-        self.result: List[str] = []
+    def __init__(self, token: str):
+        if not token:
+            raise KurobbsClientException("TOKEN is required to call Kurobbs APIs.")
+
+        self.token = token
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "osversion": "Android",
+                "devcode": "2fba3859fe9bfe9099f2696b8648c2c6",
+                "countrycode": "CN",
+                "ip": "10.0.2.233",
+                "model": "2211133C",
+                "source": "android",
+                "lang": "zh-Hans",
+                "version": "1.0.9",
+                "versioncode": "1090",
+                "token": self.token,
+                "content-type": "application/x-www-form-urlencoded; charset=utf-8",
+                "accept-encoding": "gzip",
+                "user-agent": "okhttp/3.10.0",
+            }
+        )
+        self.result: Dict[str, str] = {}
         self.exceptions: List[Exception] = []
 
-        # 配置 Session + 重试策略
-        self.session = requests.Session()
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504]
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
-
-        # 合并请求头
-        headers = BASE_HEADERS.copy()
-        headers["token"] = self.token
-        self.session.headers.update(headers)
-
     def _post(self, url: str, data: Dict[str, Any]) -> Response:
-        """通用 POST 请求封装"""
+        """Make a POST request to the specified URL with the given data."""
         try:
-            resp = self.session.post(url, data=data, timeout=15)
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            raise KurobbsClientException(f"请求 {url} 异常：{str(e)}") from e
+            response = self.session.post(url, data=data, timeout=15)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise KurobbsClientException(f"Request to {url} failed: {exc}") from exc
 
         try:
-            return Response.model_validate_json(resp.content)
-        except Exception as e:
-            raise KurobbsClientException(f"解析 {url} 响应失败：{str(e)}") from e
+            res = Response.model_validate_json(response.content)
+        except Exception as exc:  # noqa: BLE001
+            raise KurobbsClientException(f"Failed to parse response from {url}") from exc
 
-    def get_mine_info(self, type: int = USER_INFO_TYPE) -> Dict[str, Any]:
-        """获取个人信息"""
-        res = self._post(USER_MINE_URL, {"type": type})
+        logger.debug(
+            "POST {} -> code={}, success={}, msg={}",
+            url,
+            res.code,
+            res.success,
+            res.msg,
+        )
+        return res
+
+    def get_mine_info(self, type: int = 1) -> Dict[str, Any]:
+        """Get mine info."""
+        res = self._post(self.USER_MINE_URL, {"type": type})
         if not res.data:
-            raise KurobbsClientException("获取个人信息失败，响应数据为空")
+            raise KurobbsClientException("User info is missing in response.")
         return res.data
 
     def get_user_game_list(self, user_id: int) -> Dict[str, Any]:
-        """获取游戏角色列表"""
-        res = self._post(FIND_ROLE_LIST_API_URL, {"queryUserId": user_id})
+        """Get the list of games for the user."""
+        res = self._post(self.FIND_ROLE_LIST_API_URL, {"queryUserId": user_id})
         if not res.data:
-            raise KurobbsClientException("获取游戏角色列表失败")
+            raise KurobbsClientException("User game list is missing in response.")
         return res.data
 
-    def checkin(self) -> str:
-        """游戏角色签到，返回状态文案"""
+    def checkin(self):
+        """
+        Perform check-in for all default roles.
+        Each role is signed in individually; failures for one role do not block others.
+        """
         mine_info = self.get_mine_info()
-        user_id = mine_info.get("mine", {}).get("userId", 0)
-        if not user_id:
-            raise KurobbsClientException("未获取到用户 ID")
+        user_game_list = self.get_user_game_list(
+            user_id=mine_info.get("mine", {}).get("userId", 0)
+        )
 
-        game_list = self.get_user_game_list(user_id)
-        role_list = game_list.get("defaultRoleList", [])
+        role_list = user_game_list.get("defaultRoleList") or []
         if not role_list:
-            raise KurobbsClientException("未查询到游戏角色，请先在库洛论坛绑定角色")
+            raise KurobbsClientException("No default role found for the user.")
 
-        role = role_list[0]
-        # 北京时间
-        tz = ZoneInfo("Asia/Shanghai")
-        now = datetime.now(tz)
+        beijing_tz = ZoneInfo("Asia/Shanghai")
+        beijing_time = datetime.now(beijing_tz)
+        req_month = f"{beijing_time.month:02d}"
 
-        post_data = {
-            "gameId": role.get("gameId", GAME_ID_DEFAULT),
-            "serverId": role.get("serverId", ""),
-            "roleId": role.get("roleId", 0),
-            "userId": role.get("userId", 0),
-            "reqMonth": f"{now.month:02d}",
-        }
+        success_roles = []
+        failed_roles = []
 
-        res = self._post(SIGN_URL, post_data)
-        # 区分 成功 / 已签到 / 失败
-        if res.success is True:
-            return f"游戏角色{MSG_SIGN_SUCCESS}"
-        elif "已签到" in res.msg or "今日已签" in res.msg:
-            return f"游戏角色{MSG_SIGN_DONE}"
+        for role_info in role_list:
+            data = {
+                "gameId": role_info.get("gameId", 2),
+                "serverId": role_info.get("serverId"),
+                "roleId": role_info.get("roleId", 0),
+                "userId": role_info.get("userId", 0),
+                "reqMonth": req_month,
+            }
+            role_name = role_info.get("roleName", f"角色ID:{role_info.get('roleId', '?')}")
+            try:
+                resp = self._post(self.SIGN_URL, data)
+                if resp.success:
+                    success_roles.append(role_name)
+                    logger.info("签到奖励成功 [{}]", role_name)
+                else:
+                    failed_roles.append(f"{role_name}({resp.msg})")
+                    logger.warning("签到奖励失败 [{}]: {}", role_name, resp.msg)
+            except KurobbsClientException as e:
+                failed_roles.append(f"{role_name}(异常: {e})")
+                logger.error("签到奖励异常 [{}]: {}", role_name, e)
+
+        # 汇总结果
+        if success_roles:
+            self.result["checkin"] = f"签到奖励成功: {', '.join(success_roles)}"
+        if failed_roles:
+            self.exceptions.append(
+                KurobbsClientException(f"签到奖励失败: {'; '.join(failed_roles)}")
+            )
+
+    def sign_in(self) -> Response:
+        """Perform the community sign-in operation."""
+        return self._post(self.USER_SIGN_URL, {"gameId": 2})
+
+    def _process_sign_action(
+        self,
+        action_name: str,
+        action_method: Callable[[], Response],
+        success_message: str,
+        failure_message: str,
+    ):
+        """Handle the common logic for a single sign-in action."""
+        resp = action_method()
+        if resp.success:
+            self.result[action_name] = success_message
+            logger.info("{} -> {}", action_name, success_message)
         else:
-            raise KurobbsClientException(f"游戏角色{MSG_SIGN_FAIL}：{res.msg}")
+            self.exceptions.append(KurobbsClientException(f"{failure_message}, {resp.msg}"))
 
-    def sign_in(self) -> str:
-        """社区签到，返回状态文案"""
-        res = self._post(USER_SIGN_URL, {"gameId": GAME_ID_DEFAULT})
-        if res.success is True:
-            return f"社区{MSG_SIGN_SUCCESS}"
-        elif "已签到" in res.msg or "今日已签" in res.msg:
-            return f"社区{MSG_SIGN_DONE}"
-        else:
-            raise KurobbsClientException(f"社区{MSG_SIGN_FAIL}：{res.msg}")
-
-    def start(self) -> None:
-        """执行全部签到流程"""
-        # 1. 角色签到
+    def start(self):
+        """Start the sign-in process (multi‑role checkin + community sign‑in)."""
+        # 多角色签到，即使基础信息获取失败也继续社区签到
         try:
-            ret = self.checkin()
-            self.result.append(ret)
-            logger.info(ret)
+            self.checkin()
         except KurobbsClientException as e:
             self.exceptions.append(e)
-            logger.error(e)
+            logger.error(str(e))
 
-        # 2. 社区签到
-        try:
-            ret = self.sign_in()
-            self.result.append(ret)
-            logger.info(ret)
-        except KurobbsClientException as e:
-            self.exceptions.append(e)
-            logger.error(e)
+        # 社区签到（与角色无关）
+        self._process_sign_action(
+            action_name="sign_in",
+            action_method=self.sign_in,
+            success_message="社区签到成功",
+            failure_message="社区签到失败",
+        )
+
+        self._log()
 
     @property
     def msg(self) -> str:
-        return " | ".join(self.result) if self.result else "暂无签到信息"
+        parts = list(self.result.values())
+        if parts:
+            return "; ".join(parts) + "!"
+        return ""
 
-    def has_error(self) -> bool:
-        return len(self.exceptions) > 0
+    def _log(self):
+        """Log the results and raise a combined exception if any errors occurred."""
+        if msg := self.msg:
+            logger.info(msg)
+        if self.exceptions:
+            raise KurobbsClientException("; ".join(map(str, self.exceptions)))
 
 
 def main():
-    # 日志初始化 + 敏感信息脱敏
-    debug_mode = parse_bool(os.getenv("DEBUG", ""))
-    secrets = [
-        os.getenv("TOKEN", ""),
-        os.getenv("BARK_DEVICE_KEY", ""),
-        os.getenv("BARK_SERVER_URL", ""),
-        os.getenv("SERVER3_SEND_KEY", ""),
-    ]
-    configure_logger(debug=debug_mode, secrets=secrets)
+    # Configure logging as early as possible to avoid leaking secrets in GitHub Actions logs.
+    configure_logger(
+        debug=parse_bool(os.getenv("DEBUG", "")),
+        secrets=[
+            os.getenv("TOKEN", ""),
+            os.getenv("BARK_DEVICE_KEY", ""),
+            os.getenv("BARK_SERVER_URL", ""),
+            os.getenv("SERVER3_SEND_KEY", ""),
+        ],
+    )
 
-    # 加载配置
     try:
         settings = Settings.load()
-    except SettingsError as e:
-        logger.error(f"配置加载失败：{e}")
+    except SettingsError as exc:
+        logger.error(str(exc))
         sys.exit(1)
 
     notifier = NotificationService(settings)
 
     try:
-        client = KurobbsClient(settings.token)
-        client.start()
-        notify_text = client.msg
-
-        # 拼接错误信息
-        if client.has_error():
-            err_text = "；".join(str(e) for e in client.exceptions)
-            notify_text += f"【异常】{err_text}"
-
-        notifier.send(notify_text)
-
-        if client.has_error():
-            sys.exit(1)
-
-    except Exception as e:
-        logger.exception("程序运行异常")
-        notifier.send(f"库洛签到程序异常：{str(e)}")
+        kurobbs = KurobbsClient(settings.token)
+        kurobbs.start()
+        if kurobbs.msg:
+            notifier.send(kurobbs.msg)
+    except KurobbsClientException as e:
+        logger.error(str(e))
+        notifier.send(str(e))
+        sys.exit(1)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("An unexpected error occurred: {}", e)
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+    
